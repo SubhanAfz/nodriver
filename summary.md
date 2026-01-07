@@ -1,0 +1,105 @@
+# nodriver anti-bot / scraper notes (detailed)
+
+## What the project claims (from README)
+- Positions itself as the successor to **undetected-chromedriver**, avoiding Selenium/WebDriver and using direct DevTools Protocol (CDP) control.
+- States that “direct communication” improves resistance against WAFs and that defaults are optimized to “stay undetected for most anti‑bot solutions.”
+
+## Concrete implementation details in the codebase
+
+### 1) Direct CDP control (no WebDriver)
+**Claim:** it avoids Selenium/WebDriver binaries.
+
+**Implementation detail:** the package’s `Browser`/`Tab` objects talk to Chrome via the DevTools protocol connection (CDP), and the `start()` helper returns a `Browser` object created from a `Config` instance rather than a WebDriver session. This removes the WebDriver automation surface entirely (no `chromedriver` binary).
+
+**Relevant code paths:**
+- `nodriver.core.util.start()` constructs `Config` and then `Browser.create(config)`.
+- `nodriver.core.browser.Browser.create()` spawns the browser and uses CDP internally.
+
+### 2) Default launch arguments (stealth-ish defaults)
+**Claim:** “best practice defaults” for quick startup and staying undetected.
+
+**Implementation detail:** `Config` contains a **default argument list** that is always passed to Chrome unless overridden. These flags can reduce common automation artifacts, popups, and infobars that can be fingerprinted:
+
+```python
+# nodriver/core/config.py (Config._default_browser_args)
+[
+    "--remote-allow-origins=*",
+    "--no-first-run",
+    "--no-service-autorun",
+    "--no-default-browser-check",
+    "--homepage=about:blank",
+    "--no-pings",
+    "--password-store=basic",
+    "--disable-infobars",
+    "--disable-breakpad",
+    "--disable-dev-shm-usage",
+    "--disable-session-crashed-bubble",
+    "--disable-search-engine-choice-screen",
+]
+```
+
+When building the final CLI args, `Config.__call__()` also sets:
+- `--user-data-dir=<temp profile>` (fresh profile per run, unless you pass a custom profile).
+- `--disable-features=IsolateOrigins,site-per-process` (and optionally `DisableLoadExtensionCommandLineSwitch` if extensions are used).
+- `--headless=new` if headless mode is enabled.
+- `--no-sandbox` if sandbox is disabled.
+- `--remote-debugging-host` and `--remote-debugging-port` if you attach to an existing session.
+
+**Implication:** these are the concrete launch flags that shape the browser’s automation surface and behavior out of the box.
+
+### 3) Fresh profile + cleanup
+**Claim:** uses a fresh profile and cleans up after exit.
+
+**Implementation detail:** when `user_data_dir` is not provided, `Config` uses `temp_profile_dir()` and later cleanup logic in `deconstruct_browser()` removes the profile directory. This reduces cross‑run state and can mitigate certain detection vectors tied to stale profiles.
+
+### 4) Headless UA cleanup
+**Claim:** avoid typical headless detection heuristics.
+
+**Implementation detail:** in headless mode the Tab prepares a sanitized UA string by removing the literal `"Headless"` token.
+
+```python
+# nodriver/core/tab.py (_prepare_headless)
+resp = await self._send_oneshot(cdp.runtime.evaluate(expression="navigator.userAgent"))
+...
+ua = response.value
+await self._send_oneshot(
+    cdp.network.set_user_agent_override(user_agent=ua.replace("Headless", ""))
+)
+```
+
+**Implication:** removes a common headless marker at runtime without changing other UA details.
+
+### 5) “Expert mode” overrides (explicitly *more* detectable)
+**Claim:** expert mode is for debugging and can make you more detectable.
+
+**Implementation details:**
+- `start(expert=True)` documents that it adds **`--disable-web-security`** and **`--disable-site-isolation-trials`**. This relaxes isolation and can surface different fingerprints.
+- When expert mode is enabled, `_prepare_expert()` injects a script that forces `Element.attachShadow()` to always open shadow roots.
+
+```javascript
+// nodriver/core/tab.py (_prepare_expert)
+Element.prototype._attachShadow = Element.prototype.attachShadow;
+Element.prototype.attachShadow = function () {
+    return this._attachShadow({ mode: "open" });
+};
+```
+
+**Implication:** these changes are helpful for debugging and DOM access, but they are not stealth techniques; they can increase detectability.
+
+### 6) Visual checkbox helper (Cloudflare)
+**Claim:** the README advertises a `tab.cf_verify()` helper to click Cloudflare’s “verify” checkbox.
+
+**Implementation detail:** the README describes image‑based detection using OpenCV templates to locate the checkbox and click it. This is a human‑verification helper rather than a core stealth mechanism and only works outside expert mode.
+
+## Summary of “bypass” mechanics (as implemented)
+- **No WebDriver / chromedriver**: avoids the standard WebDriver fingerprinting surface by speaking CDP directly.
+- **Launch defaults**: flags like `--disable-infobars`, `--no-first-run`, and `--disable-features=IsolateOrigins,site-per-process` reduce automation artifacts and make behavior more “normal.”
+- **Headless UA cleanup**: strips the `Headless` token from the UA string when running headless.
+- **Fresh profile per run**: reduces persistent state that can build a fingerprint over time.
+- **Expert-mode features are *not stealth***: they intentionally trade stealth for debugging convenience.
+
+## Where to look in the source
+- `nodriver/core/config.py` — default args list and final CLI argument composition.
+- `nodriver/core/util.py` — `start()` helper and expert‑mode documentation.
+- `nodriver/core/tab.py` — `_prepare_headless()` and `_prepare_expert()` script injection.
+- `README.md` — high‑level claims + `tab.cf_verify()` description.
